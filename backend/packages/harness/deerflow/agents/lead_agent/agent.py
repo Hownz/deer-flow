@@ -488,6 +488,27 @@ def _make_lead_agent(config: RunnableConfig, *, app_config: AppConfig):
     extra_tools = [update_agent] if agent_name else []
     # Default lead agent (unchanged behavior)
     raw_tools = get_available_tools(model_name=model_name, groups=agent_config.tool_groups if agent_config else None, subagent_enabled=subagent_enabled, app_config=resolved_app_config)
+
+    # ── Enforce TwinCAT validation for PLC agents ──────────────
+    # Prepended BEFORE skill-policy filtering so PLC tools
+    # participate in tool-policy and deferred-search pipelines.
+    if agent_name and ("plc" in agent_name.lower() or "twincat" in agent_name.lower()):
+        try:
+            from deerflow.tools.plc_tools import get_plc_tools
+
+            plc_force_tools = get_plc_tools()
+            raw_tools = list(plc_force_tools) + raw_tools  # prepend for priority
+            logger.info(
+                "[PLC TOOLS] Added %d PLC tool(s) for agent '%s': %s",
+                len(plc_force_tools), agent_name,
+                [t.name for t in plc_force_tools],
+            )
+        except Exception:
+            logger.warning(
+                "[PLC TOOLS] Failed to load PLC tools for agent '%s'",
+                agent_name, exc_info=True,
+            )
+
     filtered = filter_tools_by_skill_allowed_tools(raw_tools + extra_tools, skills_for_tool_policy)
     final_tools, setup = assemble_deferred_tools(filtered, enabled=resolved_app_config.tool_search.enabled)
     return create_agent(

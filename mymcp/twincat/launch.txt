@@ -1,0 +1,5 @@
+# MCP Server (stdio, 由 extensions_config 自动拉起)
+python mymcp/twincat/mcp_server.py
+
+# HTTP Server (独立, 手动验证)
+python mymcp/twincat/http_server.py --host 0.0.0.0 --port 8089

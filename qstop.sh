@@ -3,9 +3,10 @@
 # qstop.sh — DeerFlow 一键停止 + 清理
 #
 # 行为：
-#   1) 通过 deerflow 自带的 scripts/serve.sh --stop 停止 Gateway/Frontend/Nginx
-#   2) 兜底再按端口 / 关键字清理残留进程
-#   3) 清理 PID 文件与本次运行的临时文件（保留 logs 供排错）
+#   1) 停止 FreeCAD MCP / MyMCP (默认 8088)
+#   2) 通过 deerflow 自带的 scripts/serve.sh --stop 停止 Gateway/Frontend/Nginx
+#   3) 兜底再按端口 / 关键字清理残留进程
+#   4) 清理 PID 文件与本次运行的临时文件（保留 logs 供排错）
 #
 # 用法：
 #   ./qstop.sh           # 正常停止
@@ -20,6 +21,7 @@ cd "$REPO_ROOT"
 LOG_DIR="$REPO_ROOT/logs"
 PID_DIR="$REPO_ROOT/logs/pids"
 TEMP_DIR="$REPO_ROOT/temp"
+MYMCP_PORT="${GSK_CAD_MYMCP_PORT:-8088}"
 
 export PATH="/usr/sbin:/usr/local/sbin:$PATH"
 
@@ -91,6 +93,20 @@ _kill_nginx() {
     _kill_pattern "nginx"
 }
 
+_kill_mymcp() {
+    if [ -f "$PID_DIR/mymcp.pid" ]; then
+        local pid
+        read -r pid < "$PID_DIR/mymcp.pid" || true
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "▶ 停止 FreeCAD MCP / MyMCP (pid=$pid, port=$MYMCP_PORT)"
+            [ "$FORCE_KILL" = true ] && kill -9 "$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_DIR/mymcp.pid"
+    fi
+    _kill_pattern "freecad_sse_server.py"
+    _kill_port "$MYMCP_PORT"
+}
+
 # ── 1) 优先走 deerflow 自己的 stop（最干净） ─────────────────────────────
 SERVE="$REPO_ROOT/scripts/serve.sh"
 if [ -x "$SERVE" ]; then
@@ -102,19 +118,20 @@ fi
 
 # ── 2) 兜底清理（如果上面没杀干净） ───────────────────────────────────────
 echo "▶ 兜底清理：进程与端口"
+_kill_mymcp
 _kill_pattern "uvicorn app.gateway.app:app"
 _kill_pattern "next dev"
 _kill_pattern "next start"
 _kill_pattern "next-server"
 _kill_nginx
-for port in 8001 3000 2026; do _kill_port "$port"; done
+for port in "$MYMCP_PORT" 8001 3000 2026; do _kill_port "$port"; done
 
 # ── 3) 清理 PID 文件 ───────────────────────────────────────────────────
 [ -d "$PID_DIR" ] && find "$PID_DIR" -type f -name "*.pid" -delete 2>/dev/null || true
 
 # ── 4) 等待端口彻底释放 ───────────────────────────────────────────────
 echo "▶ 等待端口释放"
-for port in 8001 3000 2026; do
+for port in "$MYMCP_PORT" 8001 3000 2026; do
     elapsed=0
     while is_port_listening "$port"; do
         if [ "$elapsed" -ge 10 ]; then

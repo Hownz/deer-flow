@@ -3,9 +3,10 @@
 # qstart.sh — DeerFlow 一键启动（dev 模式，daemon 后台运行）
 #
 # 行为：
-#   1) 复用 deerflow 仓库的 scripts/serve.sh --dev --daemon --skip-install
-#   2) 启动 Gateway (8001) + Frontend (3000) + Nginx (2026)
-#   3) 入口仍是 http://localhost:2026
+#   1) 启动 FreeCAD MCP / MyMCP (默认 8088，日志 logs/mymcp.log)
+#   2) 复用 deerflow 仓库的 scripts/serve.sh --dev --daemon --skip-install
+#   3) 启动 Gateway (8001) + Frontend (3000) + Nginx (2026)
+#   4) 入口仍是 http://localhost:2026
 #
 # 位置：项目根目录
 #
@@ -22,6 +23,8 @@ cd "$REPO_ROOT"
 
 LOG_DIR="$REPO_ROOT/logs"
 PID_DIR="$REPO_ROOT/logs/pids"
+MYMCP_PORT="${GSK_CAD_MYMCP_PORT:-8088}"
+MYMCP_HOST="${GSK_CAD_MYMCP_HOST:-127.0.0.1}"
 
 mkdir -p "$LOG_DIR" "$PID_DIR" \
     "$REPO_ROOT/temp/client_body_temp" \
@@ -122,21 +125,69 @@ port_owner() {
     esac
 }
 
+start_mymcp() {
+    local script="$REPO_ROOT/mymcp/cad/freecad_sse_server.py"
+    local python_bin="$REPO_ROOT/mymcp/cad/.venv/bin/python"
+
+    if [ ! -f "$script" ]; then
+        echo "✗ 找不到 FreeCAD MCP 服务脚本：$script" >&2
+        exit 1
+    fi
+    if [ ! -x "$python_bin" ]; then
+        echo "✗ 找不到 MyMCP Python 环境：$python_bin" >&2
+        echo "  请先在 mymcp/cad 中完成依赖同步，再启动 FreeCAD MCP" >&2
+        exit 1
+    fi
+
+    if is_port_listening "$MYMCP_PORT"; then
+        owner=$(port_owner "$MYMCP_PORT")
+        if [ "$owner" = "self" ]; then
+            echo "  ✔ FreeCAD MCP 已在监听 → http://localhost:$MYMCP_PORT/sse"
+            return 0
+        fi
+        pid=$(lsof -nP -iTCP:"$MYMCP_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)
+        cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+        echo "✗ FreeCAD MCP 端口 $MYMCP_PORT 已被其他项目占用 (pid=$pid, cwd=$cwd)" >&2
+        exit 1
+    fi
+
+    echo "▶ 启动 FreeCAD MCP / MyMCP（端口 $MYMCP_PORT）…"
+    (
+        cd "$REPO_ROOT/mymcp/cad"
+        exec "$python_bin" "$script" --host "$MYMCP_HOST" --port "$MYMCP_PORT"
+    ) > "$LOG_DIR/mymcp.log" 2>&1 &
+    echo $! > "$PID_DIR/mymcp.pid"
+    disown || true
+
+    local elapsed=0
+    while ! is_port_listening "$MYMCP_PORT"; do
+        if [ "$elapsed" -ge 45 ]; then
+            echo "    ✗ FreeCAD MCP (port $MYMCP_PORT) 等待超时" >&2
+            echo "      查看日志：tail -50 $LOG_DIR/mymcp.log" >&2
+            exit 1
+        fi
+        sleep 1
+        elapsed=$((elapsed+1))
+    done
+    echo "    ✔ FreeCAD MCP → http://localhost:$MYMCP_PORT/sse"
+}
+
 show_status() {
     echo "=== DeerFlow 运行状态 ==="
-    for port in 8001 3000 2026; do
+    for port in "$MYMCP_PORT" 8001 3000 2026; do
         if is_port_listening "$port"; then
             owner=$(port_owner "$port")
             pid="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -1 || true)"
             case "$owner" in
                 self|other) echo "  ✔ 端口 $port  监听中  pid=${pid:-?}  归属=$owner" ;;
+                *)          echo "  ✔ 端口 $port  监听中  pid=${pid:-?}  归属=unknown" ;;
             esac
         else
             echo "  ✗ 端口 $port  未监听"
         fi
     done
     echo
-    echo "日志: $LOG_DIR/{gateway,frontend,nginx}.log"
+    echo "日志: $LOG_DIR/{mymcp,gateway,frontend,nginx}.log"
     echo "停止: $REPO_ROOT/qstop.sh"
 }
 
@@ -149,7 +200,7 @@ esac
 # serve.sh 在 nginx 端口冲突时会调用 stop_all 把 gateway/frontend 一起杀掉，
 # 这里前置判断可以避免无谓的回滚。如果只是 DeerFlow 自己的残留，
 # qstop.sh 已经先清理过了；这里只需拦下"别人占了"的情况。
-for port in 2026 8001 3000; do
+for port in "$MYMCP_PORT" 2026 8001 3000; do
     if is_port_listening "$port"; then
         owner=$(port_owner "$port")
         if [ "$owner" = "other" ]; then
@@ -170,19 +221,22 @@ if [ ! -x "$SERVE" ]; then
 fi
 
 if [ "$ACTION" = "start-fg" ]; then
+    "$REPO_ROOT/qstop.sh" >/dev/null 2>&1 || true
+    start_mymcp
     echo "▶ 前台启动 DeerFlow（Ctrl+C 停止）…"
     exec "$SERVE" --dev
 fi
 
 # daemon 模式：先停旧的，再后台启动
 "$REPO_ROOT/qstop.sh" >/dev/null 2>&1 || true
+start_mymcp
 
 echo "▶ 后台启动 DeerFlow（dev 模式）…"
 nohup "$SERVE" --dev --daemon --skip-install > "$LOG_DIR/serve-daemon.log" 2>&1 &
 echo $! > "$PID_DIR/serve.pid"
 disown || true
 
-# 等待 3 个端口就绪
+# 等待 DeerFlow 3 个端口就绪
 echo "  等待服务就绪："
 for entry in "Gateway 8001 30" "Frontend 3000 120" "Nginx 2026 15"; do
     name=$(echo "$entry" | awk '{print $1}')
@@ -210,7 +264,9 @@ cat <<EOF
   Gateway：  http://localhost:8001
   Frontend： http://localhost:3000
 
-  日志：     $LOG_DIR/{gateway,frontend,nginx}.log
+  FreeCAD MCP： http://localhost:$MYMCP_PORT/sse
+
+  日志：     $LOG_DIR/{mymcp,gateway,frontend,nginx}.log
   停止：     $REPO_ROOT/qstop.sh
 ==========================================
 EOF

@@ -1,0 +1,10 @@
+[project]
+name = "twincat"
+version = "0.1.0"
+description = "TwinCAT PLC Validator MCP + HTTP Server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "fastmcp>=3.2.3",
+]
