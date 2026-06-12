@@ -9,7 +9,13 @@ from typing import TYPE_CHECKING
 from deerflow.config.agents_config import load_agent_soul
 from deerflow.skills.storage import get_or_new_skill_storage
 from deerflow.skills.types import Skill, SkillCategory
-from deerflow.subagents import get_available_subagent_names
+
+# get_available_subagent_names is imported lazily inside apply_prompt_template
+# to break the subagents <-> lead_agent import cycle:
+#   subagents/__init__ -> executor -> agents/__init__ -> lead_agent/__init__ ->
+#   lead_agent/agent -> lead_agent/prompt -> subagents (get_available_subagent_names)
+# The function is only used at L223 below; deferring the import until then means
+# the subagents package is fully initialised by the time we read its symbols.
 from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section
 
 if TYPE_CHECKING:
@@ -221,6 +227,7 @@ def _build_subagent_section(max_concurrent: int, *, app_config: AppConfig | None
         Formatted subagent section string.
     """
     n = max_concurrent
+    from deerflow.subagents import get_available_subagent_names  # noqa: PLC0415
     available_names = get_available_subagent_names(app_config=app_config) if app_config is not None else get_available_subagent_names()
     bash_available = "bash" in available_names
 

@@ -6,9 +6,13 @@ from deerflow.config import get_app_config
 from deerflow.config.app_config import AppConfig
 from deerflow.reflection import resolve_variable
 from deerflow.sandbox.security import is_host_bash_allowed
-from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, task_tool, view_image_tool
+from deerflow.tools.builtins import ask_clarification_tool, present_file_tool, view_image_tool
 from deerflow.tools.mcp_metadata import tag_mcp_tool
 from deerflow.tools.sync import make_sync_tool_wrapper
+
+# task_tool is imported lazily inside get_available_tools() to break the
+# subagents → executor → agents → tools → task_tool import cycle.  See
+# tools/builtins/__init__.py for the same rationale at the source.
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +21,21 @@ BUILTIN_TOOLS = [
     ask_clarification_tool,
 ]
 
-SUBAGENT_TOOLS = [
-    task_tool,
-    # task_status_tool is no longer exposed to LLM (backend handles polling internally)
-]
+
+def _get_subagent_tools() -> list:
+    """Lazy loader for subagent tools.
+
+    Kept lazy because importing task_tool transitively imports
+    ``deerflow.subagents`` (via task_tool.py), which on certain import orders
+    (e.g. when ``deerflow.subagents`` is being initialised first) closes a
+    circular dependency back through ``deerflow.agents`` -> ``deerflow.tools``.
+    """
+    from deerflow.tools.builtins import task_tool  # noqa: PLC0415
+
+    return [
+        task_tool,
+        # task_status_tool is no longer exposed to LLM (backend handles polling internally)
+    ]
 
 
 def _is_host_bash_tool(tool: object) -> bool:
@@ -97,7 +112,7 @@ def get_available_tools(
 
     # Add subagent tools only if enabled via runtime parameter
     if subagent_enabled:
-        builtin_tools.extend(SUBAGENT_TOOLS)
+        builtin_tools.extend(_get_subagent_tools())
         logger.info("Including subagent tools (task)")
 
     # If no model_name specified, use the first model (default)
@@ -156,12 +171,26 @@ def get_available_tools(
     except Exception as e:
         logger.warning(f"Failed to load ACP tool: {e}")
 
-    logger.info(f"Total tools loaded: {len(loaded_tools)}, built-in tools: {len(builtin_tools)}, MCP tools: {len(mcp_tools)}, ACP tools: {len(acp_tools)}")
+    # ── PLC Validation Tools ──────────────────────────────────
+    # PLC tools wrap filesystem writes with mandatory TwinCAT validation.
+    plc_tools: list[BaseTool] = []
+    try:
+        from deerflow.tools.plc_tools import get_plc_tools
+
+        plc_tools = get_plc_tools()
+        if plc_tools:
+            logger.info(f"Loaded {len(plc_tools)} PLC tool(s): {[t.name for t in plc_tools]}")
+    except ImportError:
+        logger.debug("PLC tools module not available (twincat-validator not installed)")
+    except Exception:
+        logger.warning("Failed to load PLC tools", exc_info=True)
+
+    logger.info(f"Total tools loaded: {len(loaded_tools)}, built-in tools: {len(builtin_tools)}, MCP tools: {len(mcp_tools)}, PLC tools: {len(plc_tools)}, ACP tools: {len(acp_tools)}")
 
     # Deduplicate by tool name — config-loaded tools take priority, followed by
     # built-ins, MCP tools, and ACP tools.  Duplicate names cause the LLM to
     # receive ambiguous or concatenated function schemas (issue #1803).
-    all_tools = [_ensure_sync_invocable_tool(t) for t in loaded_tools + builtin_tools + mcp_tools + acp_tools]
+    all_tools = [_ensure_sync_invocable_tool(t) for t in loaded_tools + builtin_tools + mcp_tools + plc_tools + acp_tools]
     seen_names: set[str] = set()
     unique_tools: list[BaseTool] = []
     for t in all_tools:

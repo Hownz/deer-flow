@@ -8,7 +8,14 @@ from langchain.agents.middleware import AgentMiddleware
 from langgraph.runtime import Runtime
 
 from deerflow.agents.middlewares.tool_call_metadata import clone_ai_message_with_tool_calls
-from deerflow.subagents.executor import MAX_CONCURRENT_SUBAGENTS
+# Re-exported from subagents.executor for backward compatibility, but imported
+# lazily to break the executor <-> lead_agent <-> middleware import cycle.
+# At runtime, deerflow.subagents.executor is always initialised before this
+# middleware is constructed (the lead agent factory builds it after loading
+# the agent module that depends on us), so a lazy import inside the class
+# body would still work.  Easier: just hardcode the default to match
+# subagents/executor.py MAX_CONCURRENT_SUBAGENTS = 3 and re-bind inside __init__.
+MAX_CONCURRENT_SUBAGENTS = 3  # mirrors deerflow.subagents.executor.MAX_CONCURRENT_SUBAGENTS
 
 logger = logging.getLogger(__name__)
 
