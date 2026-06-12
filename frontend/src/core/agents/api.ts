@@ -80,8 +80,13 @@ export async function updateAgent(
   return res.json() as Promise<Agent>;
 }
 
-export async function deleteAgent(name: string): Promise<void> {
-  const res = await fetch(`${getBackendBaseURL()}/api/agents/${name}`, {
+export async function deleteAgent(
+  name: string,
+  options: { target?: "user" | "default" } = {},
+): Promise<void> {
+  const target = options.target ?? "user";
+  const qs = target === "user" ? "" : `?target=${encodeURIComponent(target)}`;
+  const res = await fetch(`${getBackendBaseURL()}/api/agents/${name}${qs}`, {
     method: "DELETE",
   });
   if (!res.ok) throw new Error(`Failed to delete agent: ${res.statusText}`);

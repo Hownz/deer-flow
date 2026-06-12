@@ -51,6 +51,13 @@ def _make_paths_mock(tmp_path: Path) -> MagicMock:
     paths.agents_dir = tmp_path / "agents"
     paths.user_agent_dir = lambda user_id, name: tmp_path / "users" / user_id / "agents" / name
     paths.user_agents_dir = lambda user_id: tmp_path / "users" / user_id / "agents"
+    # Three-tier resolution (per-user > default > legacy) was added in the
+    # default-layer change. Tests that use this mock should NOT see default
+    # layer interference; point default_agent_dir at a never-existing path
+    # so resolve_agent_dir falls through to the per-user/legacy tiers.
+    default_root = tmp_path / "users" / "default" / "agents"
+    paths.default_agent_dir = lambda name: default_root / name
+    paths.default_agents_dir = default_root
     return paths
 
 

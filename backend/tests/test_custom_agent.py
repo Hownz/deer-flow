@@ -3,17 +3,48 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import yaml
 from fastapi.testclient import TestClient
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from deerflow.config.agents_api_config import AgentsApiConfig, get_agents_api_config, set_agents_api_config
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _admin_user() -> SimpleNamespace:
+    """Build a SimpleNamespace mirroring User with system_role=admin."""
+    return SimpleNamespace(id="00000000-0000-0000-0000-000000000001", system_role="admin")
+
+
+def _regular_user() -> SimpleNamespace:
+    """Build a SimpleNamespace mirroring User with system_role=user."""
+    return SimpleNamespace(id="00000000-0000-0000-0000-000000000002", system_role="user")
+
+
+class _StampUserMiddleware(BaseHTTPMiddleware):
+    """Inject a fake ``request.state.user`` for the duration of a request.
+
+    The production auth path (``AuthMiddleware``) does this from a JWT cookie.
+    Tests that don't mount the global middleware need a replacement so the
+    inline ``_require_admin`` guard in ``routers/agents.py`` can read the
+    role. Modeled on the SimpleNamespace pattern in
+    ``tests/test_mcp_config_secrets.py:320-328``.
+    """
+
+    def __init__(self, app, user: SimpleNamespace) -> None:
+        super().__init__(app)
+        self._user = user
+
+    async def dispatch(self, request, call_next):
+        request.state.user = self._user
+        return await call_next(request)
 
 
 def _make_paths(base_dir: Path):
@@ -375,20 +406,32 @@ class TestMemoryFilePath:
 # ===========================================================================
 
 
-def _make_test_app(tmp_path: Path):
-    """Create a FastAPI app with the agents router, patching paths to tmp_path."""
+def _make_test_app(tmp_path: Path, user: SimpleNamespace | None = None):
+    """Create a FastAPI app with the agents router, patching paths to tmp_path.
+
+    When ``user`` is provided, a tiny middleware stamps ``request.state.user``
+    on every request so the inline ``_require_admin`` guard can read the role.
+    This mirrors the production ``AuthMiddleware`` behavior without mounting
+    the full auth stack.
+    """
     from fastapi import FastAPI
 
     from app.gateway.routers.agents import router
 
     app = FastAPI()
+    if user is not None:
+        app.add_middleware(_StampUserMiddleware, user=user)
     app.include_router(router)
     return app
 
 
 @pytest.fixture()
 def agent_client(tmp_path):
-    """TestClient with agents router, using tmp_path as base_dir."""
+    """TestClient with agents router, using tmp_path as base_dir.
+
+    Stamps an admin user so the ``_require_admin`` guard never blocks
+    default-layer writes. Per-user writes by an authed user also pass.
+    """
     import app.gateway.routers.agents as agents_router
 
     paths_instance = _make_paths(tmp_path)
@@ -397,7 +440,30 @@ def agent_client(tmp_path):
     with patch("deerflow.config.agents_config.get_paths", return_value=paths_instance), patch.object(agents_router, "get_paths", return_value=paths_instance):
         set_agents_api_config(AgentsApiConfig(enabled=True))
         try:
-            app = _make_test_app(tmp_path)
+            app = _make_test_app(tmp_path, user=_admin_user())
+            with TestClient(app) as client:
+                client._tmp_path = tmp_path  # type: ignore[attr-defined]
+                yield client
+        finally:
+            set_agents_api_config(previous_config)
+
+
+@pytest.fixture()
+def regular_agent_client(tmp_path):
+    """TestClient that stamps a non-admin user.
+
+    Used to verify that ``target=default`` writes are rejected with 403 while
+    per-user writes still succeed.
+    """
+    import app.gateway.routers.agents as agents_router
+
+    paths_instance = _make_paths(tmp_path)
+    previous_config = AgentsApiConfig(**get_agents_api_config().model_dump())
+
+    with patch("deerflow.config.agents_config.get_paths", return_value=paths_instance), patch.object(agents_router, "get_paths", return_value=paths_instance):
+        set_agents_api_config(AgentsApiConfig(enabled=True))
+        try:
+            app = _make_test_app(tmp_path, user=_regular_user())
             with TestClient(app) as client:
                 client._tmp_path = tmp_path  # type: ignore[attr-defined]
                 yield client
@@ -634,3 +700,247 @@ class TestAgentsApiDisabled:
 
         assert get_response.status_code == 403
         assert put_response.status_code == 403
+
+
+# ===========================================================================
+# 9. System default agents layer (`users/default/agents/`)
+# ===========================================================================
+#
+# These tests cover the third priority tier that the agents scan understands:
+# the system-default layer visible to every authenticated user. The admin-only
+# write guard on the default target is verified via two fixtures:
+# - `agent_client` stamps an admin user (can write to both user and default)
+# - `regular_agent_client` stamps a regular user (can write to user only)
+
+
+def _write_layer_agent(base_dir: Path, layer: str, name: str, *, user_id: str | None = None, config: dict | None = None, soul: str = "You are helpful.") -> Path:
+    """Write an agent into a specific on-disk layer.
+
+    Args:
+        base_dir: tmp_path base for the test.
+        layer: ``"user"``, ``"default"``, or ``"legacy"``.
+        name: Agent name.
+        user_id: Per-user layer only — the user id to nest under.
+        config: Optional config overrides; defaults to ``{"name": name}``.
+        soul: SOUL.md content.
+    """
+    if layer == "user":
+        assert user_id is not None, "user layer requires user_id"
+        agent_dir = base_dir / "users" / user_id / "agents" / name
+    elif layer == "default":
+        agent_dir = base_dir / "users" / "default" / "agents" / name
+    elif layer == "legacy":
+        agent_dir = base_dir / "agents" / name
+    else:
+        raise ValueError(f"Unknown layer: {layer}")
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    cfg = {"name": name, **(config or {})}
+    (agent_dir / "config.yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+    (agent_dir / "SOUL.md").write_text(soul, encoding="utf-8")
+    return agent_dir
+
+
+class TestDefaultLayerScanning:
+    """3-tier agent discovery: user > default > legacy."""
+
+    def test_resolve_agent_dir_three_tier(self, tmp_path, agent_client):
+        """resolve_agent_dir returns per-user > default > legacy in that order."""
+        from deerflow.config.agents_config import resolve_agent_dir
+
+        _write_layer_agent(tmp_path, "legacy", "greeter")
+        _write_layer_agent(tmp_path, "default", "greeter")
+        # No per-user entry yet — should hit default.
+
+        resolved = resolve_agent_dir("greeter", user_id="alice")
+        assert resolved == (tmp_path / "users" / "default" / "agents" / "greeter").resolve()
+
+        # Now add a per-user entry — per-user should win.
+        _write_layer_agent(tmp_path, "user", "greeter", user_id="alice")
+        resolved = resolve_agent_dir("greeter", user_id="alice")
+        assert resolved == (tmp_path / "users" / "alice" / "agents" / "greeter").resolve()
+
+        # A different user still sees the default-layer copy.
+        resolved = resolve_agent_dir("greeter", user_id="bob")
+        assert resolved == (tmp_path / "users" / "default" / "agents" / "greeter").resolve()
+
+    def test_list_custom_agents_includes_default_layer(self, agent_client):
+        """An agent in users/default/agents/ appears in the list response with is_default=true."""
+        _write_layer_agent(agent_client._tmp_path, "default", "greeter", config={"description": "sys default"})
+        response = agent_client.get("/api/agents")
+        assert response.status_code == 200
+        agents = {a["name"]: a for a in response.json()["agents"]}
+        assert "greeter" in agents
+        assert agents["greeter"]["is_default"] is True
+        assert agents["greeter"]["description"] == "sys default"
+
+    def test_list_custom_agents_per_user_shadows_default(self, tmp_path):
+        """An agent present in both per-user and default layers is listed once with is_default=false."""
+        # Use a fresh regular_agent_client-like setup so we know the effective user_id
+        # is the regular user's id. We re-use the agent_client fixture shape.
+        _write_layer_agent(tmp_path, "default", "shared", config={"description": "default"})
+        _write_layer_agent(tmp_path, "user", "shared", user_id="alice", config={"description": "alice override"})
+
+        # Drive a real GET via a custom client that stamps user_id=alice via get_effective_user_id
+        import app.gateway.routers.agents as agents_router
+        from deerflow.runtime.user_context import set_current_user, reset_current_user
+
+        paths_instance = _make_paths(tmp_path)
+        with patch("deerflow.config.agents_config.get_paths", return_value=paths_instance), patch.object(agents_router, "get_paths", return_value=paths_instance):
+            set_agents_api_config(AgentsApiConfig(enabled=True))
+            try:
+                app = _make_test_app(tmp_path, user=_regular_user())
+                with TestClient(app) as client:
+                    token = set_current_user(SimpleNamespace(id="alice"))
+                    try:
+                        response = client.get("/api/agents")
+                    finally:
+                        reset_current_user(token)
+            finally:
+                set_agents_api_config(AgentsApiConfig(enabled=False))
+
+        assert response.status_code == 200
+        shared = next(a for a in response.json()["agents"] if a["name"] == "shared")
+        assert shared["is_default"] is False
+        assert shared["description"] == "alice override"
+
+    def test_list_custom_agents_default_shadows_legacy(self, agent_client):
+        """An agent present in both default and legacy layers is listed once with is_default=true."""
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "legacy", "shared-legacy-default", config={"description": "legacy"})
+        _write_layer_agent(base, "default", "shared-legacy-default", config={"description": "default"})
+
+        response = agent_client.get("/api/agents")
+        assert response.status_code == 200
+        shared = next(a for a in response.json()["agents"] if a["name"] == "shared-legacy-default")
+        assert shared["is_default"] is True
+        assert shared["description"] == "default"
+
+
+class TestDefaultLayerResponse:
+    """is_default flag in GET responses."""
+
+    def test_get_agent_returns_is_default_true_for_default_layer(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "default", "greeter", config={"description": "sys default"}, soul="hi from default")
+        response = agent_client.get("/api/agents/greeter")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_default"] is True
+        assert data["soul"] == "hi from default"
+
+    def test_get_agent_returns_is_default_false_for_legacy(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "legacy", "legacy-bot", config={"description": "legacy only"})
+        response = agent_client.get("/api/agents/legacy-bot")
+        assert response.status_code == 200
+        assert response.json()["is_default"] is False
+
+    def test_check_agent_name_taken_by_default(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "default", "taken")
+        response = agent_client.get("/api/agents/check", params={"name": "taken"})
+        assert response.status_code == 200
+        assert response.json() == {"available": False, "name": "taken"}
+
+    def test_check_agent_name_taken_by_legacy(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "legacy", "legacy-taken")
+        response = agent_client.get("/api/agents/check", params={"name": "legacy-taken"})
+        assert response.status_code == 200
+        assert response.json() == {"available": False, "name": "legacy-taken"}
+
+    def test_list_agent_response_is_default_default_false(self, agent_client):
+        """Backward-compat: per-user agents still return is_default=false in the list."""
+        base = agent_client._tmp_path
+        # The default admin user's per-user id is derived from the auth context.
+        # We write to legacy so we don't have to guess the user_id.
+        _write_layer_agent(base, "legacy", "regular-legacy", config={"description": "legacy"})
+        response = agent_client.get("/api/agents")
+        assert response.status_code == 200
+        regular = next(a for a in response.json()["agents"] if a["name"] == "regular-legacy")
+        assert regular["is_default"] is False
+
+
+class TestDefaultLayerWriteGuards:
+    """target=default writes are admin-only; target=user writes remain available to all authed users."""
+
+    def test_create_agent_target_default_as_admin(self, agent_client):
+        payload = {"name": "sys-bot", "description": "sys default", "soul": "hi", "target": "default"}
+        response = agent_client.post("/api/agents", json=payload)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["is_default"] is True
+        # File landed in the default layer.
+        assert (agent_client._tmp_path / "users" / "default" / "agents" / "sys-bot" / "config.yaml").exists()
+        # ... and not in the admin user's per-user dir.
+        # (We don't know the exact admin user_id, but we can check that the
+        # only per-user path under `users/` that matches is the default one.)
+
+    def test_create_agent_target_default_as_regular_user(self, regular_agent_client):
+        payload = {"name": "sys-bot", "description": "sys default", "soul": "hi", "target": "default"}
+        response = regular_agent_client.post("/api/agents", json=payload)
+        assert response.status_code == 403
+        # No file in the default layer.
+        assert not (regular_agent_client._tmp_path / "users" / "default" / "agents" / "sys-bot").exists()
+
+    def test_create_agent_default_target_omits_field(self, regular_agent_client):
+        """Omitting `target` defaults to 'user' — per-user write still works for non-admin."""
+        payload = {"name": "my-bot", "description": "user", "soul": "hi"}
+        response = regular_agent_client.post("/api/agents", json=payload)
+        assert response.status_code == 201
+        data = response.json()
+        assert data["is_default"] is False
+
+    def test_update_agent_default_target_as_admin(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "default", "sys-bot", config={"description": "before"}, soul="hi")
+        response = agent_client.put(
+            "/api/agents/sys-bot",
+            json={"description": "after", "target": "default"},
+        )
+        assert response.status_code == 200
+        assert response.json()["is_default"] is True
+        assert (base / "users" / "default" / "agents" / "sys-bot" / "config.yaml").read_text(encoding="utf-8").find("after") != -1
+
+    def test_update_agent_default_target_as_regular_user(self, regular_agent_client):
+        base = regular_agent_client._tmp_path
+        _write_layer_agent(base, "default", "sys-bot", config={"description": "before"}, soul="hi")
+        response = regular_agent_client.put(
+            "/api/agents/sys-bot",
+            json={"description": "after", "target": "default"},
+        )
+        assert response.status_code == 403
+
+    def test_delete_agent_default_target_as_admin(self, agent_client):
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "default", "sys-bot")
+        response = agent_client.delete("/api/agents/sys-bot", params={"target": "default"})
+        assert response.status_code == 204
+        assert not (base / "users" / "default" / "agents" / "sys-bot").exists()
+
+    def test_delete_agent_default_target_as_regular_user(self, regular_agent_client):
+        base = regular_agent_client._tmp_path
+        _write_layer_agent(base, "default", "sys-bot")
+        response = regular_agent_client.delete("/api/agents/sys-bot", params={"target": "default"})
+        assert response.status_code == 403
+        # The file is still there.
+        assert (base / "users" / "default" / "agents" / "sys-bot" / "config.yaml").exists()
+
+    def test_create_agent_409_when_name_exists_in_default(self, regular_agent_client):
+        """A per-user create with a name already in the default layer is rejected with 409."""
+        base = regular_agent_client._tmp_path
+        _write_layer_agent(base, "default", "collide")
+        payload = {"name": "collide", "description": "user", "soul": "hi"}
+        response = regular_agent_client.post("/api/agents", json=payload)
+        assert response.status_code == 409
+
+    def test_update_agent_legacy_guard_does_not_fire_for_default(self, agent_client):
+        """PUT target=default on an agent that lives in the default layer is allowed (no 409)."""
+        base = agent_client._tmp_path
+        _write_layer_agent(base, "default", "sys-bot", config={"description": "before"}, soul="hi")
+        response = agent_client.put(
+            "/api/agents/sys-bot",
+            json={"description": "after", "target": "default"},
+        )
+        assert response.status_code == 200
+

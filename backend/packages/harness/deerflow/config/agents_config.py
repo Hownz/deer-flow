@@ -52,11 +52,13 @@ class AgentConfig(BaseModel):
 def resolve_agent_dir(name: str, *, user_id: str | None = None) -> Path:
     """Return the on-disk directory for an agent, preferring the per-user layout.
 
-    Resolution order:
+    Resolution order (most specific first):
     1. ``{base_dir}/users/{user_id}/agents/{name}/`` (per-user, current layout).
-    2. ``{base_dir}/agents/{name}/`` (legacy shared layout — read-only fallback).
+    2. ``{base_dir}/users/default/agents/{name}/`` (system default, visible to all
+       authenticated users).
+    3. ``{base_dir}/agents/{name}/`` (legacy shared layout — read-only fallback).
 
-    If neither exists, the per-user path is returned so callers that intend to
+    If none exist, the per-user path is returned so callers that intend to
     create the agent write into the new layout.
 
     Args:
@@ -69,6 +71,10 @@ def resolve_agent_dir(name: str, *, user_id: str | None = None) -> Path:
     user_path = paths.user_agent_dir(effective_user, name)
     if user_path.exists():
         return user_path
+
+    default_path = paths.default_agent_dir(name)
+    if default_path.exists():
+        return default_path
 
     legacy_path = paths.agent_dir(name)
     if legacy_path.exists():
@@ -154,9 +160,12 @@ def load_agent_soul(agent_name: str | None, *, user_id: str | None = None) -> st
 def list_custom_agents(*, user_id: str | None = None) -> list[AgentConfig]:
     """Scan the agents directory and return all valid custom agents.
 
-    Returns the union of agents in the per-user layout and the legacy shared
-    layout, so that pre-migration installations remain visible until they are
-    migrated. Per-user entries shadow legacy entries with the same name.
+    Returns the union of agents across three layouts, in priority order:
+    per-user, system-default, and legacy shared. Per-user entries shadow
+    default entries with the same name; default entries shadow legacy
+    entries with the same name. The system-default layer
+    (``{base_dir}/users/default/agents/``) is visible to every authenticated
+    user.
 
     Args:
         user_id: Owner whose agents to list. Defaults to the effective user
@@ -165,16 +174,40 @@ def list_custom_agents(*, user_id: str | None = None) -> list[AgentConfig]:
     Returns:
         List of AgentConfig for each valid agent directory found.
     """
+    return [cfg for cfg, _source in list_custom_agents_with_source(user_id=user_id)]
+
+
+def list_custom_agents_with_source(
+    *, user_id: str | None = None
+) -> list[tuple[AgentConfig, str]]:
+    """Scan the agents directory and return (AgentConfig, source) pairs.
+
+    The ``source`` field is one of ``"user"``, ``"default"``, ``"legacy"``,
+    telling the caller which on-disk layer the entry came from. Shadowing
+    rules follow the iteration order: per-user wins over default, default
+    wins over legacy. This is the variant the HTTP layer should call when it
+    needs to label results (e.g., the ``is_default`` flag in AgentResponse).
+
+    Args:
+        user_id: Owner whose agents to list. Defaults to the effective user
+            from the current request context.
+
+    Returns:
+        List of ``(AgentConfig, source)`` tuples, sorted by agent name.
+    """
     paths = get_paths()
     effective_user = user_id or get_effective_user_id()
 
     seen: set[str] = set()
-    agents: list[AgentConfig] = []
+    results: list[tuple[AgentConfig, str]] = []
 
-    user_root = paths.user_agents_dir(effective_user)
-    legacy_root = paths.agents_dir
+    roots: list[tuple[Path, str]] = [
+        (paths.user_agents_dir(effective_user), "user"),
+        (paths.default_agents_dir, "default"),
+        (paths.agents_dir, "legacy"),
+    ]
 
-    for root in (user_root, legacy_root):
+    for root, source in roots:
         if not root.exists():
             continue
         for entry in sorted(root.iterdir()):
@@ -191,10 +224,10 @@ def list_custom_agents(*, user_id: str | None = None) -> list[AgentConfig]:
                 agent_cfg = load_agent_config(entry.name, user_id=effective_user)
                 if agent_cfg is None:
                     continue
-                agents.append(agent_cfg)
+                results.append((agent_cfg, source))
                 seen.add(entry.name)
             except Exception as e:
                 logger.warning(f"Skipping agent '{entry.name}': {e}")
 
-    agents.sort(key=lambda a: a.name)
-    return agents
+    results.sort(key=lambda pair: pair[0].name)
+    return results

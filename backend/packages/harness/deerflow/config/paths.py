@@ -188,6 +188,22 @@ class Paths:
         """Per-user per-agent memory: `{base_dir}/users/{user_id}/agents/{name}/memory.json`."""
         return self.user_agent_dir(user_id, agent_name) / "memory.json"
 
+    @property
+    def default_agents_dir(self) -> Path:
+        """System default agents layer visible to all authenticated users.
+
+        Path: ``{base_dir}/users/default/agents/``.
+
+        The literal ``"default"`` mirrors ``runtime.user_context.DEFAULT_USER_ID``
+        (see ``deerflow/runtime/user_context.py``); we keep a local copy here to
+        avoid importing from the runtime module and creating a new dependency edge.
+        """
+        return self.base_dir / "users" / "default" / "agents"
+
+    def default_agent_dir(self, agent_name: str) -> Path:
+        """System-default per-agent directory: ``{base_dir}/users/default/agents/{name}/``."""
+        return self.default_agents_dir / agent_name.lower()
+
     def thread_dir(self, thread_id: str, *, user_id: str | None = None) -> Path:
         """
         Host path for a thread's data.
